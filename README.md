@@ -6,15 +6,15 @@ A full-stack crypto trading strategy backtester built with React, TypeScript, Vi
 
 ### Historical Candle Chart
 
-![Historical candle chart showing ETHUSDT market data](crypto-backtester/image.png)
+![Historical candle chart showing ETHUSDT market data](image.png)
 
 ### Strategy Editor
 
-![Strategy editor with Monaco code editor and LLM prompt controls](crypto-backtester/image-1.png)
+![Strategy editor with Monaco code editor and LLM prompt controls](image-1.png)
 
 ### Backtest Results Dashboard
 
-![Backtest dashboard showing chart markers, strategy code, metrics, and trade history](crypto-backtester/image-2.png)
+![Backtest dashboard showing chart markers, strategy code, metrics, and trade history](image-2.png)
 
 ## Why This Project Stands Out
 
