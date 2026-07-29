@@ -17,6 +17,8 @@ interface ChartPanelProps {
   candles: Candle[];
   markers: ChartMarker[];
   onLoadOlder: () => void;
+  followLatest?: boolean;
+  replayLabel?: string;
 }
 
 // Calculate Simple Moving Average (SMA)
@@ -36,7 +38,7 @@ function calculateSMA(candles: Candle[], period: number) {
   return result;
 }
 
-export function ChartPanel({ candles, markers, onLoadOlder }: ChartPanelProps) {
+export function ChartPanel({ candles, markers, onLoadOlder, followLatest = false, replayLabel }: ChartPanelProps) {
   const wrapperRef = useRef<HTMLDivElement | null>(null);
   const containerRef = useRef<HTMLDivElement | null>(null);
   const chartRef = useRef<IChartApi | null>(null);
@@ -241,6 +243,8 @@ export function ChartPanel({ candles, markers, onLoadOlder }: ChartPanelProps) {
     if (!hasFitContentRef.current && activeCandles.length > 0) {
       chart.timeScale().fitContent();
       hasFitContentRef.current = true;
+    } else if (followLatest && activeCandles.length > 0) {
+      chart.timeScale().scrollToPosition(8, true);
     } else if (previousRange && addedCandles > 0 && !isReplayMode) {
       chart.timeScale().setVisibleLogicalRange({
         from: previousRange.from + addedCandles,
@@ -249,7 +253,7 @@ export function ChartPanel({ candles, markers, onLoadOlder }: ChartPanelProps) {
     }
 
     previousCandleCountRef.current = activeCandles.length;
-  }, [activeCandles, showSma20, showSma50, isReplayMode]);
+  }, [activeCandles, followLatest, showSma20, showSma50, isReplayMode]);
 
   // Sync Markers
   useEffect(() => {
@@ -257,14 +261,24 @@ export function ChartPanel({ candles, markers, onLoadOlder }: ChartPanelProps) {
     const activeTimeSet = new Set(
       activeCandles.map((c) => c.time as string | number)
     );
-    const visibleMarkers = markers.filter((m) =>
+    const replayMarker = replayLabel && activeCandles.length > 0
+      ? {
+          color: '#2962ff',
+          position: 'belowBar' as const,
+          shape: 'arrowUp' as const,
+          text: replayLabel,
+          time: activeCandles[activeCandles.length - 1].time,
+        }
+      : null;
+    const allMarkers = replayMarker ? [...markers, replayMarker] : markers;
+    const visibleMarkers = allMarkers.filter((m) =>
       activeTimeSet.has(m.time as string | number)
     );
 
     markersRef.current.setMarkers(
       visibleMarkers.map((m) => ({ ...m, time: m.time as Time }))
     );
-  }, [markers, activeCandles]);
+  }, [markers, activeCandles, replayLabel]);
 
   const handleToggleReplay = () => {
     if (!isReplayMode && !isSelectingCutPoint) {
@@ -532,4 +546,3 @@ const EyeIcon = () => (
 // -------------------------------------------------------------
 // STYLES
 // -------------------------------------------------------------
-
