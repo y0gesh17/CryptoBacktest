@@ -16,6 +16,10 @@ A full-stack crypto trading strategy backtester built with React, TypeScript, Vi
 
 ![Backtest dashboard showing chart markers, strategy code, metrics, and trade history](image-2.png)
 
+### Additional View
+
+![Additional project view](image-3.png)
+
 ## Why This Project Stands Out
 
 - Built a complete frontend and backend workflow for testing trading ideas.
