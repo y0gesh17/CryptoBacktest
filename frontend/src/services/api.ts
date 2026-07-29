@@ -12,9 +12,21 @@ export async function fetchSymbols(): Promise<SymbolCode[]> {
   return response.data;
 }
 
-export async function fetchHistory(symbol: SymbolCode, timeframe: Timeframe): Promise<Candle[]> {
+// export async function fetchHistory(symbol: SymbolCode, timeframe: Timeframe): Promise<Candle[]> {
+//   const response = await client.get<Candle[]>('/history', {
+//     params: { symbol, timeframe },
+//   });
+
+//   return response.data;
+// }
+export async function fetchHistory(
+  symbol: SymbolCode,
+  timeframe: Timeframe,
+  before?: number,
+  limit = 300
+): Promise<Candle[]> {
   const response = await client.get<Candle[]>('/history', {
-    params: { symbol, timeframe },
+    params: { symbol, timeframe, before, limit },
   });
 
   return response.data;

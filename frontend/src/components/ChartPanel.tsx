@@ -15,13 +15,21 @@ import type { Candle, ChartMarker } from '../types/market';
 interface ChartPanelProps {
   candles: Candle[];
   markers: ChartMarker[];
+  onLoadOlder: () => void;
 }
 
-export function ChartPanel({ candles, markers }: ChartPanelProps) {
+export function ChartPanel({ candles, markers, onLoadOlder }: ChartPanelProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const chartRef = useRef<IChartApi | null>(null);
   const seriesRef = useRef<ISeriesApi<'Candlestick', Time> | null>(null);
   const markersRef = useRef<ISeriesMarkersPluginApi<Time> | null>(null);
+  const onLoadOlderRef = useRef(onLoadOlder);
+  const hasFitContentRef = useRef(false);
+  const previousCandleCountRef = useRef(0);
+
+  useEffect(() => {
+    onLoadOlderRef.current = onLoadOlder;
+  }, [onLoadOlder]);
 
   useEffect(() => {
     if (!containerRef.current) {
@@ -60,6 +68,16 @@ export function ChartPanel({ candles, markers }: ChartPanelProps) {
       wickDownColor: '#d64545',
     });
 
+    chart.timeScale().subscribeVisibleLogicalRangeChange((range) => {
+      if (!range) return;
+
+      const barsInfo = series.barsInLogicalRange(range);
+
+      if (barsInfo && barsInfo.barsBefore < 50) {
+        onLoadOlderRef.current();
+      }
+    });
+
     const markerApi = createSeriesMarkers(series, []);
 
     chartRef.current = chart;
@@ -82,6 +100,10 @@ export function ChartPanel({ candles, markers }: ChartPanelProps) {
       return;
     }
 
+    const previousRange = chart.timeScale().getVisibleLogicalRange();
+    const previousCandleCount = previousCandleCountRef.current;
+    const addedCandles = candles.length - previousCandleCount;
+
     series.setData(
       candles.map((candle) => ({
         time: candle.time as Time,
@@ -92,7 +114,17 @@ export function ChartPanel({ candles, markers }: ChartPanelProps) {
       }))
     );
 
-    chart.timeScale().fitContent();
+    if (!hasFitContentRef.current && candles.length > 0) {
+      chart.timeScale().fitContent();
+      hasFitContentRef.current = true;
+    } else if (previousRange && addedCandles > 0) {
+      chart.timeScale().setVisibleLogicalRange({
+        from: previousRange.from + addedCandles,
+        to: previousRange.to + addedCandles,
+      });
+    }
+
+    previousCandleCountRef.current = candles.length;
   }, [candles]);
 
   useEffect(() => {

@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 
 import { ChartPanel } from './components/ChartPanel';
 import { ResultsPanel } from './components/ResultsPanel';
@@ -61,6 +61,11 @@ export function App() {
   const [result, setResult] = useState<BacktestResult | null>(null);
   const [isLoading, setIsLoading] = useState(false);
   const [status, setStatus] = useState('Ready');
+  const [isLoadingOlder, setIsLoadingOlder] = useState(false);
+  const [hasMoreCandles, setHasMoreCandles] = useState(true);
+  const candlesRef = useRef<Candle[]>([]);
+  const isLoadingOlderRef = useRef(false);
+  const hasMoreCandlesRef = useRef(true);
 
   useEffect(() => {
     fetchSymbols()
@@ -72,14 +77,65 @@ export function App() {
     setIsLoading(true);
     setStatus('Loading candles...');
     setResult(null);
+    setHasMoreCandles(true);
+    hasMoreCandlesRef.current = true;
 
     fetchHistory(symbol, timeframe)
       .then((nextCandles) => {
+        candlesRef.current = nextCandles;
         setCandles(nextCandles);
+        console.log('API returned candles:', nextCandles.length);
         setStatus(`Loaded ${nextCandles.length} candles`);
       })
       .catch(() => setStatus('Could not load candles. Start the backend on port 4100.'))
       .finally(() => setIsLoading(false));
+  }, [symbol, timeframe]);
+
+  useEffect(() => {
+    candlesRef.current = candles;
+    console.log('Candles state updated:', candles.length);
+  }, [candles]);
+
+  const loadOlderCandles = useCallback(async () => {
+    const currentCandles = candlesRef.current;
+
+    if (isLoadingOlderRef.current || !hasMoreCandlesRef.current || currentCandles.length === 0) {
+      return;
+    }
+
+    isLoadingOlderRef.current = true;
+    setIsLoadingOlder(true);
+
+    try {
+      const oldestCandle = currentCandles[0];
+      console.log('Loading older candles before:', oldestCandle.time);
+      const olderCandles = await fetchHistory(symbol, timeframe, oldestCandle.time);
+
+      if (olderCandles.length === 0) {
+        hasMoreCandlesRef.current = false;
+        setHasMoreCandles(false);
+        return;
+      }
+
+      const existingTimes = new Set(currentCandles.map((candle) => candle.time));
+      const uniqueOlderCandles = olderCandles.filter((candle) => !existingTimes.has(candle.time));
+
+      if (uniqueOlderCandles.length === 0) {
+        hasMoreCandlesRef.current = false;
+        setHasMoreCandles(false);
+        return;
+      }
+
+      const nextCandles = [...uniqueOlderCandles, ...currentCandles];
+      candlesRef.current = nextCandles;
+      setCandles(nextCandles);
+      setStatus(`Loaded ${uniqueOlderCandles.length} older candles`);
+    } catch {
+      setStatus('Could not load older candles.');
+    } finally {
+      isLoadingOlderRef.current = false;
+      setIsLoadingOlder(false);
+    }
   }, [symbol, timeframe]);
 
   const handleRunStrategy = async () => {
@@ -134,7 +190,12 @@ export function App() {
       <div className="status-bar">{status}</div>
 
       <section className="workspace">
-        <ChartPanel candles={candles} markers={result?.markers ?? []} />
+        <ChartPanel
+          key={`${symbol}-${timeframe}`}
+          candles={candles}
+          markers={result?.markers ?? []}
+          onLoadOlder={loadOlderCandles}
+        />
         <StrategyEditor symbol={symbol} timeframe={timeframe} value={strategy} onChange={setStrategy} />
         <ResultsPanel metrics={result?.metrics ?? null} trades={result?.trades ?? []} />
       </section>
