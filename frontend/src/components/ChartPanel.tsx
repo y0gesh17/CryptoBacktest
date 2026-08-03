@@ -18,6 +18,8 @@ interface ChartPanelProps {
   markers: ChartMarker[];
   onLoadOlder: () => void;
   followLatest?: boolean;
+  /** When true, parent owns replay (paper mode) — hide chart's own bar replay UI. */
+  hideInternalReplay?: boolean;
   replayLabel?: string;
 }
 
@@ -38,13 +40,50 @@ function calculateSMA(candles: Candle[], period: number) {
   return result;
 }
 
-export function ChartPanel({ candles, markers, onLoadOlder, followLatest = false, replayLabel }: ChartPanelProps) {
+function calculateEMA(candles: Candle[], period: number) {
+  const result: { time: Time; value: number }[] = [];
+  const k = 2 / (period + 1);
+  let emaPrev: number | null = null;
+
+  for (let i = 0; i < candles.length; i++) {
+    const closePrice = candles[i].close;
+    if (i < period - 1) continue;
+
+    if (emaPrev === null) {
+      // Calculate the initial SMA for the first EMA value
+      let sum = 0;
+      for (let j = 0; j < period; j++) {
+        sum += candles[i - j].close;
+      }
+      emaPrev = sum / period;
+    } else {
+      // Calculate EMA using the previous EMA value
+      emaPrev = closePrice * k + emaPrev * (1 - k);
+    }
+
+    result.push({
+      time: candles[i].time as Time,
+      value: Number(emaPrev.toFixed(2)),
+    });
+  }
+  return result;
+}
+
+export function ChartPanel({
+  candles,
+  markers,
+  onLoadOlder,
+  followLatest = false,
+  hideInternalReplay = false,
+  replayLabel,
+}: ChartPanelProps) {
   const wrapperRef = useRef<HTMLDivElement | null>(null);
   const containerRef = useRef<HTMLDivElement | null>(null);
   const chartRef = useRef<IChartApi | null>(null);
   const seriesRef = useRef<ISeriesApi<'Candlestick', Time> | null>(null);
   const sma20Ref = useRef<ISeriesApi<'Line', Time> | null>(null);
   const sma50Ref = useRef<ISeriesApi<'Line', Time> | null>(null);
+  const smaEma20Ref = useRef<ISeriesApi<'Line', Time> | null>(null);
   const markersRef = useRef<ISeriesMarkersPluginApi<Time> | null>(null);
 
   const onLoadOlderRef = useRef(onLoadOlder);
@@ -55,6 +94,7 @@ export function ChartPanel({ candles, markers, onLoadOlder, followLatest = false
   // Indicator Visibility States
   const [showSma20, setShowSma20] = useState(true);
   const [showSma50, setShowSma50] = useState(true);
+  const [showEma200, setShowEma200] = useState(false);
   const [isIndicatorMenuOpen, setIsIndicatorMenuOpen] = useState(false);
 
   // Replay Engine States
@@ -73,6 +113,14 @@ export function ChartPanel({ candles, markers, onLoadOlder, followLatest = false
     onLoadOlderRef.current = onLoadOlder;
     candlesRef.current = candles;
   }, [onLoadOlder, candles]);
+
+  // Parent-owned replay (paper mode) — force chart's own replay off
+  useEffect(() => {
+    if (!hideInternalReplay) return;
+    setIsReplayMode(false);
+    setIsSelectingCutPoint(false);
+    setIsPlaying(false);
+  }, [hideInternalReplay]);
 
   // Handle Playback Interval
   useEffect(() => {
@@ -150,6 +198,13 @@ export function ChartPanel({ candles, markers, onLoadOlder, followLatest = false
       lastValueVisible: false,
     });
 
+    const smaEma20Series = chart.addSeries(LineSeries, {
+      color: '#44ff00',
+      lineWidth: 2,
+      priceLineVisible: false,
+      lastValueVisible: false,
+    });
+
     // Cut Candle Click Listener
     chart.subscribeClick((param) => {
       if (!isSelectingCutPointRef.current || !param.time) return;
@@ -181,6 +236,7 @@ export function ChartPanel({ candles, markers, onLoadOlder, followLatest = false
     seriesRef.current = series;
     sma20Ref.current = sma20Series;
     sma50Ref.current = sma50Series;
+    smaEma20Ref.current = smaEma20Series;
     markersRef.current = markerApi;
 
     return () => {
@@ -189,6 +245,9 @@ export function ChartPanel({ candles, markers, onLoadOlder, followLatest = false
       seriesRef.current = null;
       sma20Ref.current = null;
       sma50Ref.current = null;
+      smaEma20Ref.current = null;
+      hasFitContentRef.current = false;
+      previousCandleCountRef.current = 0;
       markersRef.current = null;
     };
   }, []);
@@ -232,14 +291,16 @@ export function ChartPanel({ candles, markers, onLoadOlder, followLatest = false
         close: c.close,
       }))
     );
-
+ 
     if (sma20Ref.current) {
       sma20Ref.current.setData(showSma20 ? calculateSMA(activeCandles, 20) : []);
     }
     if (sma50Ref.current) {
       sma50Ref.current.setData(showSma50 ? calculateSMA(activeCandles, 50) : []);
     }
-
+    if (smaEma20Ref.current) {
+      smaEma20Ref.current.setData(showEma200 ? calculateEMA(activeCandles, 200) : []);
+    }
     if (!hasFitContentRef.current && activeCandles.length > 0) {
       chart.timeScale().fitContent();
       hasFitContentRef.current = true;
@@ -253,7 +314,7 @@ export function ChartPanel({ candles, markers, onLoadOlder, followLatest = false
     }
 
     previousCandleCountRef.current = activeCandles.length;
-  }, [activeCandles, followLatest, showSma20, showSma50, isReplayMode]);
+  }, [activeCandles, followLatest, showSma20, showSma50, showEma200, isReplayMode]);
 
   // Sync Markers
   useEffect(() => {
@@ -325,6 +386,13 @@ export function ChartPanel({ candles, markers, onLoadOlder, followLatest = false
                 </div>
                 <div
                   style={styles.dropdownItem}
+                  onClick={() => setShowEma200(!showEma200)}
+                >
+                  <span style={{ color: '#44ff00', fontWeight: 600 }}>● EMA 200</span>
+                  <input type="checkbox" checked={showEma200} readOnly />
+                </div>
+                <div
+                  style={styles.dropdownItem}
                   onClick={() => setShowSma50(!showSma50)}
                 >
                   <span style={{ color: '#FF6D00', fontWeight: 600 }}>● SMA 50</span>
@@ -336,23 +404,25 @@ export function ChartPanel({ candles, markers, onLoadOlder, followLatest = false
 
           <div style={styles.separator} />
 
-          {/* Bar Replay Trigger */}
-          <button
-            style={{
-              ...styles.headerBtn,
-              ...(isReplayMode || isSelectingCutPoint ? styles.activeReplayBtn : {}),
-            }}
-            onClick={handleToggleReplay}
-          >
-            <ReplayIcon />
-            <span>
-              {isSelectingCutPoint
-                ? 'Cancel Cut'
-                : isReplayMode
-                ? 'Exit Replay'
-                : 'Bar Replay'}
-            </span>
-          </button>
+          {/* Bar Replay — disabled when parent (paper mode) owns the replay cursor */}
+          {!hideInternalReplay && (
+            <button
+              style={{
+                ...styles.headerBtn,
+                ...(isReplayMode || isSelectingCutPoint ? styles.activeReplayBtn : {}),
+              }}
+              onClick={handleToggleReplay}
+            >
+              <ReplayIcon />
+              <span>
+                {isSelectingCutPoint
+                  ? 'Cancel Cut'
+                  : isReplayMode
+                  ? 'Exit Replay'
+                  : 'Bar Replay'}
+              </span>
+            </button>
+          )}
         </div>
       </div>
 
@@ -386,6 +456,18 @@ export function ChartPanel({ candles, markers, onLoadOlder, followLatest = false
               <button
                 style={styles.iconBtn}
                 onClick={() => setShowSma50(false)}
+                title="Hide Indicator"
+              >
+                <EyeIcon />
+              </button>
+            </div>
+          )}
+          {showEma200 && (
+            <div style={styles.legendRow}>
+              <span style={{ color: '#44ff00', fontWeight: 600 }}>EMA 200</span>
+              <button
+                style={styles.iconBtn}
+                onClick={() => setShowEma200(false)}
                 title="Hide Indicator"
               >
                 <EyeIcon />

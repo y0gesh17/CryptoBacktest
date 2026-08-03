@@ -7,6 +7,25 @@ import type {
   Trade,
 } from '../types/market.js';
 
+/**
+ * Backtest engine — interview-friendly mental model:
+ *
+ *   1. Compile user strategy JS into a callable function
+ *   2. Walk candles oldest → newest
+ *      a. Risk exits first (stop-loss / take-profit)
+ *      b. Strategy decides buy / sell
+ *      c. Mark portfolio to market (equity + drawdown)
+ *   3. Force-close any open position at the last candle
+ *   4. Aggregate trades into performance metrics
+ */
+
+const INITIAL_CAPITAL = 10_000;
+const COMMISSION_RATE = 0.001; // 0.1% per side
+
+// ---------------------------------------------------------------------------
+// Public types
+// ---------------------------------------------------------------------------
+
 interface BacktestResult {
   markers: ChartMarker[];
   trades: Trade[];
@@ -36,155 +55,247 @@ interface StrategyContext {
   state: Record<string, unknown>;
   buy: (options?: RiskOptions) => void;
   sell: () => void;
-  sma: (period: number, source?: 'open' | 'high' | 'low' | 'close' | 'volume') => number | null;
+  sma: (period: number, source?: CandleSource) => number | null;
 }
 
-const initialCapital = 10000;
-const commissionRate = 0.001;
+type CandleSource = 'open' | 'high' | 'low' | 'close' | 'volume';
+type StrategyFn = (context: StrategyContext) => void;
+
+interface Portfolio {
+  cash: number;
+  position: OpenPosition | null;
+}
+
+interface SimulationState {
+  portfolio: Portfolio;
+  markers: ChartMarker[];
+  trades: Trade[];
+  equity: EquityPoint[];
+  peakEquity: number;
+  maxDrawdownPct: number;
+  strategyState: Record<string, unknown>;
+}
+
+// ---------------------------------------------------------------------------
+// 1. Entry point — thin orchestration layer
+// ---------------------------------------------------------------------------
 
 export function runBacktest(candles: Candle[], strategyCode: string): BacktestResult {
   const strategy = compileStrategy(strategyCode);
-  const markers: ChartMarker[] = [];
-  const trades: Trade[] = [];
-  const equity: EquityPoint[] = [];
-  let cash = initialCapital;
-  let position: OpenPosition | null = null;
-  let peakEquity = initialCapital;
-  let maxDrawdownPct = 0;
-  const state: Record<string, unknown> = {};
-
-  const buy = (candle: Candle, index: number, options: RiskOptions = {}) => {
-    if (position) {
-      return;
-    }
-
-    const commission = cash * commissionRate;
-    const availableCash = cash - commission;
-    const quantity = availableCash / candle.close;
-
-    position = {
-      entryTime: candle.time,
-      entryIndex: index,
-      entryPrice: candle.close,
-      quantity,
-      takeProfitPrice: calculateTakeProfitPrice(candle.close, options.takeProfitPct),
-      stopLossPrice: calculateStopLossPrice(candle.close, options.stopLossPct),
-    };
-    cash = 0;
-
-    markers.push({
-      time: candle.time,
-      position: 'belowBar',
-      color: '#0f9f6e',
-      shape: 'arrowUp',
-      text: createEntryMarkerText(position),
-    });
-  };
-
-  const sell = (
-    candle: Candle,
-    index: number,
-    exitReason: ExitReason = 'SELL',
-    exitPrice = candle.close
-  ) => {
-    if (!position) {
-      return;
-    }
-
-    const grossExitValue = position.quantity * exitPrice;
-    const exitCommission = grossExitValue * commissionRate;
-    const entryValue = position.quantity * position.entryPrice;
-    const entryCommission = entryValue * commissionRate;
-    const grossPnl = grossExitValue - entryValue;
-    const commission = entryCommission + exitCommission;
-    const netPnl = grossPnl - commission;
-
-    cash = grossExitValue - exitCommission;
-
-    trades.push({
-      id: trades.length + 1,
-      entryTime: position.entryTime,
-      exitTime: candle.time,
-      entryPrice: round(position.entryPrice),
-      exitPrice: round(exitPrice),
-      exitReason,
-      quantity: Number(position.quantity.toFixed(6)),
-      grossPnl: round(grossPnl),
-      commission: round(commission),
-      netPnl: round(netPnl),
-      holdingBars: index - position.entryIndex,
-    });
-
-    markers.push({
-      time: candle.time,
-      position: 'aboveBar',
-      color: getExitMarkerColor(exitReason),
-      shape: 'arrowDown',
-      text: getExitMarkerText(exitReason),
-    });
-
-    position = null;
-  };
-
-  candles.forEach((candle, index) => {
-    checkRiskExit(candle, index);
-
-    const context: StrategyContext = {
-      candle,
-      candles,
-      index,
-      position,
-      state,
-      buy: (options) => buy(candle, index, options),
-      sell: () => sell(candle, index),
-      sma: (period, source = 'close') => sma(candles, index, period, source),
-    };
-
-    strategy(context);
-
-    const currentEquity = position ? position.quantity * candle.close : cash;
-    peakEquity = Math.max(peakEquity, currentEquity);
-    const drawdownPct = peakEquity === 0 ? 0 : ((peakEquity - currentEquity) / peakEquity) * 100;
-    maxDrawdownPct = Math.max(maxDrawdownPct, drawdownPct);
-
-    equity.push({
-      time: candle.time,
-      value: round(currentEquity),
-    });
-  });
-
-  if (position && candles.length > 0) {
-    sell(candles[candles.length - 1], candles.length - 1, 'END_OF_TEST');
-  }
-
-  const finalEquity = equity.at(-1)?.value ?? initialCapital;
+  const simulation = simulate(candles, strategy);
+  const finalEquity = simulation.equity.at(-1)?.value ?? INITIAL_CAPITAL;
 
   return {
-    markers,
-    trades,
-    equity,
-    metrics: calculateMetrics(trades, finalEquity, maxDrawdownPct),
+    markers: simulation.markers,
+    trades: simulation.trades,
+    equity: simulation.equity,
+    metrics: calculateMetrics(simulation.trades, finalEquity, simulation.maxDrawdownPct),
   };
+}
 
-  function checkRiskExit(candle: Candle, index: number): void {
-    if (!position) {
-      return;
-    }
+// ---------------------------------------------------------------------------
+// 2. Simulation — candle-by-candle loop
+// ---------------------------------------------------------------------------
 
-    if (position.stopLossPrice !== undefined && candle.low <= position.stopLossPrice) {
-      sell(candle, index, 'STOP_LOSS', position.stopLossPrice);
-      return;
-    }
+function simulate(candles: Candle[], strategy: StrategyFn): SimulationState {
+  const state = createInitialState();
 
-    if (position.takeProfitPrice !== undefined && candle.high >= position.takeProfitPrice) {
-      sell(candle, index, 'TAKE_PROFIT', position.takeProfitPrice);
-    }
+  for (let index = 0; index < candles.length; index += 1) {
+    processCandle(state, candles, index, strategy);
+  }
+
+  // Step 3: if still in a trade when history ends, flatten at last close
+  if (state.portfolio.position && candles.length > 0) {
+    const lastIndex = candles.length - 1;
+    closeLong(state, candles[lastIndex], lastIndex, 'END_OF_TEST');
+  }
+
+  return state;
+}
+
+function createInitialState(): SimulationState {
+  return {
+    portfolio: { cash: INITIAL_CAPITAL, position: null },
+    markers: [],
+    trades: [],
+    equity: [],
+    peakEquity: INITIAL_CAPITAL,
+    maxDrawdownPct: 0,
+    strategyState: {},
+  };
+}
+
+/**
+ * One bar of the backtest. Order matters:
+ * risk management → strategy signals → equity snapshot.
+ */
+function processCandle(
+  state: SimulationState,
+  candles: Candle[],
+  index: number,
+  strategy: StrategyFn
+): void {
+  const candle = candles[index];
+
+  // a) Honor SL/TP before the strategy can act on this bar
+  applyRiskExits(state, candle, index);
+
+  // b) Let the user strategy call buy() / sell()
+  strategy(buildStrategyContext(state, candles, index));
+
+  // c) Mark-to-market: cash if flat, position value if long
+  recordEquity(state, candle);
+}
+
+function buildStrategyContext(
+  state: SimulationState,
+  candles: Candle[],
+  index: number
+): StrategyContext {
+  const candle = candles[index];
+
+  return {
+    candle,
+    candles,
+    index,
+    position: state.portfolio.position,
+    state: state.strategyState,
+    buy: (options) => openLong(state, candle, index, options),
+    sell: () => closeLong(state, candle, index, 'SELL'),
+    sma: (period, source = 'close') => sma(candles, index, period, source),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// 2a. Risk management — automatic exits
+// ---------------------------------------------------------------------------
+
+function applyRiskExits(state: SimulationState, candle: Candle, index: number): void {
+  const position = state.portfolio.position;
+  if (!position) return;
+
+  // Stop-loss checked first (conservative: if both hit in same bar, SL wins)
+  if (position.stopLossPrice !== undefined && candle.low <= position.stopLossPrice) {
+    closeLong(state, candle, index, 'STOP_LOSS', position.stopLossPrice);
+    return;
+  }
+
+  if (position.takeProfitPrice !== undefined && candle.high >= position.takeProfitPrice) {
+    closeLong(state, candle, index, 'TAKE_PROFIT', position.takeProfitPrice);
   }
 }
 
-function compileStrategy(strategyCode: string): (context: StrategyContext) => void {
+// ---------------------------------------------------------------------------
+// 2b. Portfolio actions — open / close a long
+// ---------------------------------------------------------------------------
+
+function openLong(
+  state: SimulationState,
+  candle: Candle,
+  index: number,
+  options: RiskOptions = {}
+): void {
+  // Long-only, one position at a time
+  if (state.portfolio.position) return;
+
+  const entryPrice = candle.close;
+  const commission = state.portfolio.cash * COMMISSION_RATE;
+  const spendableCash = state.portfolio.cash - commission;
+  const quantity = spendableCash / entryPrice;
+
+  state.portfolio.position = {
+    entryTime: candle.time,
+    entryIndex: index,
+    entryPrice,
+    quantity,
+    takeProfitPrice: priceFromPct(entryPrice, options.takeProfitPct, 'up'),
+    stopLossPrice: priceFromPct(entryPrice, options.stopLossPct, 'down'),
+  };
+  state.portfolio.cash = 0;
+
+  state.markers.push({
+    time: candle.time,
+    position: 'belowBar',
+    color: '#0f9f6e',
+    shape: 'arrowUp',
+    text: entryMarkerText(state.portfolio.position),
+  });
+}
+
+function closeLong(
+  state: SimulationState,
+  candle: Candle,
+  index: number,
+  exitReason: ExitReason,
+  exitPrice = candle.close
+): void {
+  const position = state.portfolio.position;
+  if (!position) return;
+
+  const grossExitValue = position.quantity * exitPrice;
+  const exitCommission = grossExitValue * COMMISSION_RATE;
+  const entryValue = position.quantity * position.entryPrice;
+  const entryCommission = entryValue * COMMISSION_RATE;
+
+  const grossPnl = grossExitValue - entryValue;
+  const commission = entryCommission + exitCommission;
+  const netPnl = grossPnl - commission;
+
+  state.portfolio.cash = grossExitValue - exitCommission;
+  state.portfolio.position = null;
+
+  state.trades.push({
+    id: state.trades.length + 1,
+    entryTime: position.entryTime,
+    exitTime: candle.time,
+    entryPrice: round(position.entryPrice),
+    exitPrice: round(exitPrice),
+    exitReason,
+    quantity: Number(position.quantity.toFixed(6)),
+    grossPnl: round(grossPnl),
+    commission: round(commission),
+    netPnl: round(netPnl),
+    holdingBars: index - position.entryIndex,
+  });
+
+  state.markers.push({
+    time: candle.time,
+    position: 'aboveBar',
+    color: exitMarkerColor(exitReason),
+    shape: 'arrowDown',
+    text: exitMarkerText(exitReason),
+  });
+}
+
+// ---------------------------------------------------------------------------
+// 2c. Equity curve + drawdown
+// ---------------------------------------------------------------------------
+
+function recordEquity(state: SimulationState, candle: Candle): void {
+  const { portfolio } = state;
+  const currentEquity = portfolio.position
+    ? portfolio.position.quantity * candle.close
+    : portfolio.cash;
+
+  state.peakEquity = Math.max(state.peakEquity, currentEquity);
+
+  const drawdownPct =
+    state.peakEquity === 0 ? 0 : ((state.peakEquity - currentEquity) / state.peakEquity) * 100;
+  state.maxDrawdownPct = Math.max(state.maxDrawdownPct, drawdownPct);
+
+  state.equity.push({ time: candle.time, value: round(currentEquity) });
+}
+
+// ---------------------------------------------------------------------------
+// Strategy sandbox — compile user JS safely enough for a demo
+// ---------------------------------------------------------------------------
+
+function compileStrategy(strategyCode: string): StrategyFn {
   const legacyStateNames = extractLegacyStateNames(strategyCode);
-  const normalizedStrategyCode = strategyCode.replace(/\bvar\s+/g, '');
+  const body = strategyCode.replace(/\bvar\s+/g, '');
+
+  // new Function isolates the strategy; Proxy + with() lets `state.x = 1`
+  // and bare `x = 1` both persist across candles via strategyState.
   const factory = new Function(
     'context',
     'legacyStateNames',
@@ -202,56 +313,13 @@ const sandboxState = new Proxy(state, {
   },
 });
 with (sandboxState) {
-${normalizedStrategyCode}
+${body}
 }`
   );
 
-  return (context: StrategyContext) => {
+  return (context) => {
     factory(context, legacyStateNames);
   };
-}
-
-function calculateTakeProfitPrice(entryPrice: number, takeProfitPct: number | undefined): number | undefined {
-  return isValidPct(takeProfitPct) ? entryPrice * (1 + takeProfitPct / 100) : undefined;
-}
-
-function calculateStopLossPrice(entryPrice: number, stopLossPct: number | undefined): number | undefined {
-  return isValidPct(stopLossPct) ? entryPrice * (1 - stopLossPct / 100) : undefined;
-}
-
-function isValidPct(value: number | undefined): value is number {
-  return typeof value === 'number' && Number.isFinite(value) && value > 0;
-}
-
-function createEntryMarkerText(position: OpenPosition): string {
-  const riskLabels = [
-    position.takeProfitPrice === undefined ? null : `TP ${round(position.takeProfitPrice)}`,
-    position.stopLossPrice === undefined ? null : `SL ${round(position.stopLossPrice)}`,
-  ].filter(Boolean);
-
-  return riskLabels.length === 0 ? 'BUY' : `BUY ${riskLabels.join(' ')}`;
-}
-
-function getExitMarkerText(exitReason: ExitReason): string {
-  const labels: Record<ExitReason, string> = {
-    SELL: 'SELL',
-    TAKE_PROFIT: 'TP HIT',
-    STOP_LOSS: 'SL HIT',
-    END_OF_TEST: 'EOT',
-  };
-
-  return labels[exitReason];
-}
-
-function getExitMarkerColor(exitReason: ExitReason): string {
-  const colors: Record<ExitReason, string> = {
-    SELL: '#d64545',
-    TAKE_PROFIT: '#0f9f6e',
-    STOP_LOSS: '#d64545',
-    END_OF_TEST: '#52616b',
-  };
-
-  return colors[exitReason];
 }
 
 function extractLegacyStateNames(strategyCode: string): string[] {
@@ -267,44 +335,99 @@ function extractLegacyStateNames(strategyCode: string): string[] {
   return [...names];
 }
 
+// ---------------------------------------------------------------------------
+// Indicators
+// ---------------------------------------------------------------------------
+
 function sma(
   candles: Candle[],
   index: number,
   period: number,
-  source: 'open' | 'high' | 'low' | 'close' | 'volume'
+  source: CandleSource
 ): number | null {
-  if (period <= 0 || index + 1 < period) {
-    return null;
-  }
+  if (period <= 0 || index + 1 < period) return null;
 
-  const slice = candles.slice(index + 1 - period, index + 1);
-  const total = slice.reduce((sum, candle) => sum + candle[source], 0);
+  let total = 0;
+  for (let i = index + 1 - period; i <= index; i += 1) {
+    total += candles[i][source];
+  }
 
   return total / period;
 }
+
+// ---------------------------------------------------------------------------
+// 4. Performance metrics from closed trades
+// ---------------------------------------------------------------------------
 
 function calculateMetrics(
   trades: Trade[],
   finalEquity: number,
   maxDrawdownPct: number
 ): BacktestMetrics {
-  const netPnl = finalEquity - initialCapital;
-  const winningTrades = trades.filter((trade) => trade.netPnl > 0);
-  const grossProfit = winningTrades.reduce((sum, trade) => sum + trade.netPnl, 0);
-  const grossLoss = Math.abs(
-    trades.filter((trade) => trade.netPnl < 0).reduce((sum, trade) => sum + trade.netPnl, 0)
-  );
+  const netPnl = finalEquity - INITIAL_CAPITAL;
+  const winners = trades.filter((trade) => trade.netPnl > 0);
+  const losers = trades.filter((trade) => trade.netPnl < 0);
+
+  const grossProfit = winners.reduce((sum, trade) => sum + trade.netPnl, 0);
+  const grossLoss = Math.abs(losers.reduce((sum, trade) => sum + trade.netPnl, 0));
 
   return {
-    initialCapital,
+    initialCapital: INITIAL_CAPITAL,
     finalEquity: round(finalEquity),
     netPnl: round(netPnl),
-    totalReturnPct: round((netPnl / initialCapital) * 100),
+    totalReturnPct: round((netPnl / INITIAL_CAPITAL) * 100),
     totalTrades: trades.length,
-    winRatePct: trades.length === 0 ? 0 : round((winningTrades.length / trades.length) * 100),
+    winRatePct: trades.length === 0 ? 0 : round((winners.length / trades.length) * 100),
     maxDrawdownPct: round(maxDrawdownPct),
-    profitFactor: grossLoss === 0 ? (grossProfit > 0 ? Number.POSITIVE_INFINITY : 0) : round(grossProfit / grossLoss),
+    profitFactor: profitFactor(grossProfit, grossLoss),
   };
+}
+
+function profitFactor(grossProfit: number, grossLoss: number): number {
+  if (grossLoss === 0) return grossProfit > 0 ? Number.POSITIVE_INFINITY : 0;
+  return round(grossProfit / grossLoss);
+}
+
+// ---------------------------------------------------------------------------
+// Small helpers
+// ---------------------------------------------------------------------------
+
+function priceFromPct(
+  entryPrice: number,
+  pct: number | undefined,
+  direction: 'up' | 'down'
+): number | undefined {
+  if (typeof pct !== 'number' || !Number.isFinite(pct) || pct <= 0) return undefined;
+  return direction === 'up' ? entryPrice * (1 + pct / 100) : entryPrice * (1 - pct / 100);
+}
+
+function entryMarkerText(position: OpenPosition): string {
+  const parts = [
+    position.takeProfitPrice === undefined ? null : `TP ${round(position.takeProfitPrice)}`,
+    position.stopLossPrice === undefined ? null : `SL ${round(position.stopLossPrice)}`,
+  ].filter(Boolean);
+
+  return parts.length === 0 ? 'BUY' : `BUY ${parts.join(' ')}`;
+}
+
+function exitMarkerText(exitReason: ExitReason): string {
+  const labels: Record<ExitReason, string> = {
+    SELL: 'SELL',
+    TAKE_PROFIT: 'TP HIT',
+    STOP_LOSS: 'SL HIT',
+    END_OF_TEST: 'EOT',
+  };
+  return labels[exitReason];
+}
+
+function exitMarkerColor(exitReason: ExitReason): string {
+  const colors: Record<ExitReason, string> = {
+    SELL: '#d64545',
+    TAKE_PROFIT: '#0f9f6e',
+    STOP_LOSS: '#d64545',
+    END_OF_TEST: '#52616b',
+  };
+  return colors[exitReason];
 }
 
 function round(value: number): number {
